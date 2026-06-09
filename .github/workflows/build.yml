@@ -1,0 +1,44 @@
+name: Build GainBuddy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure CMake
+        run: cmake -B build -G "Visual Studio 17 2022"
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Upload VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: GainBuddy-Windows-VST3
+          path: build/GainBuddy_artefacts/Release/VST3/
+
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Upload VST3 Mac
+        uses: actions/upload-artifact@v4
+        with:
+          name: GainBuddy-Mac-VST3
+          path: build/GainBuddy_artefacts/Release/VST3/
+      - name: Upload AU
+        uses: actions/upload-artifact@v4
+        with:
+          name: GainBuddy-Mac-AU
+          path: build/GainBuddy_artefacts/Release/AU/
