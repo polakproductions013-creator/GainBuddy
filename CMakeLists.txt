@@ -1,51 +1,41 @@
-name: Build GainBuddy
+cmake_minimum_required(VERSION 3.22)
+project(GainBuddy VERSION 3.0.0)
 
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
+add_subdirectory(JUCE)
 
-jobs:
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+juce_add_plugin(GainBuddy
+    VERSION                     3.0.0
+    COMPANY_NAME                "YourName"
+    PLUGIN_MANUFACTURER_CODE    Yrnm
+    PLUGIN_CODE                 Gnbd
+    FORMATS                     VST3 AU Standalone
+    PRODUCT_NAME                "GainBuddy"
+    IS_SYNTH                    FALSE
+    NEEDS_MIDI_INPUT            FALSE
+    NEEDS_MIDI_OUTPUT           FALSE
+    IS_MIDI_EFFECT              FALSE
+    EDITOR_WANTS_KEYBOARD_FOCUS FALSE
+    COPY_PLUGIN_AFTER_BUILD     FALSE
+)
 
-      - name: Configure CMake
-        run: cmake -B build -G "Visual Studio 17 2022"
+juce_generate_juce_header(GainBuddy)
 
-      - name: Build
-        run: cmake --build build --config Release --parallel
+target_sources(GainBuddy PRIVATE
+    PluginProcessor.cpp
+    PluginEditor.cpp
+)
 
-      - name: Upload VST3
-        uses: actions/upload-artifact@v4
-        with:
-          name: GainBuddy-Windows-VST3
-          path: build/GainBuddy_artefacts/Release/VST3/
+target_compile_definitions(GainBuddy PUBLIC
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+    JUCE_VST3_CAN_REPLACE_VST2=0
+)
 
-  build-mac:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Configure CMake
-        run: cmake -B build -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
-
-      - name: Build
-        run: cmake --build build --config Release --parallel
-
-      - name: Upload VST3 Mac
-        uses: actions/upload-artifact@v4
-        with:
-          name: GainBuddy-Mac-VST3
-          path: build/GainBuddy_artefacts/Release/VST3/
-
-      - name: Upload AU
-        uses: actions/upload-artifact@v4
-        with:
-          name: GainBuddy-Mac-AU
-          path: build/GainBuddy_artefacts/Release/AU/
+target_link_libraries(GainBuddy PRIVATE
+    juce::juce_audio_utils
+    juce::juce_dsp
+    juce::juce_audio_plugin_client
+    juce::juce_recommended_config_flags
+    juce::juce_recommended_lto_flags
+    juce::juce_recommended_warning_flags
+)
