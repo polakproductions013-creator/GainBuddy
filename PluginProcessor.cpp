@@ -1,151 +1,162 @@
+#include "PluginProcessor.h"
 #include "PluginEditor.h"
 
-GainBuddyAudioProcessorEditor::GainBuddyAudioProcessorEditor(GainBuddyAudioProcessor& p)
-    : AudioProcessorEditor(&p), proc(p), lufsDisplay(p)
+GainBuddyAudioProcessor::GainBuddyAudioProcessor()
+    : AudioProcessor (BusesProperties()
+                      .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+                      .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+      apvts (*this, nullptr, "Parameters", createParameters())
+{}
+
+GainBuddyAudioProcessor::~GainBuddyAudioProcessor() {}
+
+juce::AudioProcessorValueTreeState::ParameterLayout
+GainBuddyAudioProcessor::createParameters()
 {
-    setSize(380, 400);
-    setResizable(false, false);
+    std::vector<std::unique_ptr<juce::RangedAudioParameter>> p;
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (
+        "trim", "Trim",
+        juce::NormalisableRange<float> (-1.0f, 1.0f, 0.01f), 0.0f));
+    return { p.begin(), p.end() };
+}
 
-    addAndMakeVisible(lufsDisplay);
+static constexpr float LUFS_CORRECTION = 3.32f;
 
-    for (auto* b : {&btn18, &btn24})
+void GainBuddyAudioProcessor::setFilterCoeffs (KFilter& kL, KFilter& kR)
+{
+    auto preCoeffs = juce::dsp::IIR::Coefficients<float>::makeHighShelf (
+        sampleRate_, 1681.0f, 0.7071f,
+        juce::Decibels::decibelsToGain (4.0f));
+    *kL.pre.coefficients = *preCoeffs;
+    *kR.pre.coefficients = *preCoeffs;
+
+    auto rlbCoeffs = juce::dsp::IIR::Coefficients<float>::makeHighPass (
+        sampleRate_, 38.135f, 0.5003f);
+    *kL.rlb.coefficients = *rlbCoeffs;
+    *kR.rlb.coefficients = *rlbCoeffs;
+}
+
+void GainBuddyAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
+{
+    sampleRate_      = sampleRate;
+    samplesPerBlock_ = samplesPerBlock;
+
+    juce::dsp::ProcessSpec mono { sampleRate, (juce::uint32)samplesPerBlock, 1 };
+    kInL.prepare(mono);  kInR.prepare(mono);
+    kOutL.prepare(mono); kOutR.prepare(mono);
+    kInL.reset(); kInR.reset(); kOutL.reset(); kOutR.reset();
+    setFilterCoeffs (kInL, kInR);
+    setFilterCoeffs (kOutL, kOutR);
+
+    double blocksPerSec = sampleRate / (double)samplesPerBlock;
+    int ringSize = (int)std::ceil (blocksPerSec * 3.0) + 2;
+    inputRing.init  (ringSize);
+    outputRing.init (ringSize);
+
+    smoothedGainLin.reset (sampleRate, 0.15);
+    smoothedGainLin.setCurrentAndTargetValue (1.0f);
+}
+
+void GainBuddyAudioProcessor::releaseResources()
+{
+    kInL.reset(); kInR.reset(); kOutL.reset(); kOutR.reset();
+}
+
+static float msToLUFS (double ms)
+{
+    if (ms < 1e-10) return -70.0f;
+    return -0.691f + 10.0f * std::log10f ((float)ms);
+}
+
+void GainBuddyAudioProcessor::snapToTarget (float targetLUFS)
+{
+    currentTarget.store (targetLUFS);
+    float measured = inputLUFS.load();
+    if (measured <= -69.0f) return;
+
+    float correctionDB = targetLUFS - measured;
+    correctionDB = juce::jlimit (-40.0f, 40.0f, correctionDB);
+    autoGainDB.store (correctionDB);
+
+    float trimDB = apvts.getRawParameterValue ("trim")->load();
+    smoothedGainLin.setTargetValue (
+        juce::Decibels::decibelsToGain (correctionDB + trimDB));
+}
+
+void GainBuddyAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
+                                              juce::MidiBuffer&)
+{
+    juce::ScopedNoDenormals noDenormals;
+    const int numSamples  = buffer.getNumSamples();
+    const int numChannels = buffer.getNumChannels();
+
+    auto* L = buffer.getWritePointer (0);
+    auto* R = numChannels > 1 ? buffer.getWritePointer (1) : nullptr;
+
+    double inSumSq = 0.0;
+    for (int i = 0; i < numSamples; ++i)
     {
-        b->setLookAndFeel(&laf);
-        addAndMakeVisible(b);
+        float kl = kInL.process (L[i]);
+        float kr = R ? kInR.process (R[i]) : kl;
+        double mono = (double)(kl*kl + kr*kr) * 0.5;
+        if (std::isfinite (mono)) inSumSq += mono;
+    }
+    double inMS = inSumSq / (double)numSamples;
+    if (std::isfinite (inMS)) {
+        inputRing.push (inMS);
+        float raw = msToLUFS (inputRing.mean());
+        if (std::isfinite (raw))
+            inputLUFS.store (raw + LUFS_CORRECTION);
     }
 
-    btn18.onClick = [this] { proc.snapToTarget(-18.0f); updateTargetButtons(); };
-    btn24.onClick = [this] { proc.snapToTarget(-24.0f); updateTargetButtons(); };
+    float trimDB  = apvts.getRawParameterValue ("trim")->load();
+    float totalDB = autoGainDB.load() + trimDB;
+    smoothedGainLin.setTargetValue (juce::Decibels::decibelsToGain (totalDB));
 
-    trimKnob.setLookAndFeel(&laf);
-    trimKnob.setSliderStyle(juce::Slider::RotaryVerticalDrag);
-    trimKnob.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
-    addAndMakeVisible(trimKnob);
-    trimAttach = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
-        proc.apvts, "trim", trimKnob);
+    for (int i = 0; i < numSamples; ++i)
+    {
+        float g = smoothedGainLin.getNextValue();
+        for (int ch = 0; ch < numChannels; ++ch)
+            buffer.getWritePointer(ch)[i] *= g;
+    }
 
-    auto setupLbl = [&](juce::Label& l, juce::Colour c, float sz) {
-        l.setJustificationType(juce::Justification::centred);
-        l.setColour(juce::Label::textColourId, c);
-        l.setColour(juce::Label::backgroundColourId, GB::lcdBg);
-        l.setFont(juce::Font("Courier New", sz, juce::Font::bold));
-        addAndMakeVisible(l);
-    };
-    setupLbl(trimValLabel,  GB::lcdOrange,             12.0f);
-    setupLbl(autoGainLabel, juce::Colour(0xff888888),  11.0f);
-
-    updateTargetButtons();
-    startTimerHz(30);
+    double outSumSq = 0.0;
+    for (int i = 0; i < numSamples; ++i)
+    {
+        float kl = kOutL.process (L[i]);
+        float kr = R ? kOutR.process (R[i]) : kl;
+        double mono = (double)(kl*kl + kr*kr) * 0.5;
+        if (std::isfinite (mono)) outSumSq += mono;
+    }
+    double outMS = outSumSq / (double)numSamples;
+    if (std::isfinite (outMS)) {
+        outputRing.push (outMS);
+        float raw = msToLUFS (outputRing.mean());
+        if (std::isfinite (raw))
+            displayLUFS.store (raw + LUFS_CORRECTION);
+    }
 }
 
-GainBuddyAudioProcessorEditor::~GainBuddyAudioProcessorEditor()
+juce::AudioProcessorEditor* GainBuddyAudioProcessor::createEditor()
 {
-    stopTimer();
-    trimKnob.setLookAndFeel(nullptr);
-    btn18.setLookAndFeel(nullptr);
-    btn24.setLookAndFeel(nullptr);
+    return new GainBuddyAudioProcessorEditor (*this);
 }
 
-void GainBuddyAudioProcessorEditor::updateTargetButtons()
+void GainBuddyAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
-    float t = proc.getCurrentTarget();
-    bool is18 = (t > -19.0f);
-
-    // Active button: orange with glow
-    // Inactive button: permanently black
-    btn18.setColour(juce::TextButton::buttonColourId,
-                    is18 ? GB::orange : GB::btnBlack);
-    btn24.setColour(juce::TextButton::buttonColourId,
-                    !is18 ? GB::orange : GB::btnBlack);
-
-    // Text: black on orange, dim grey on black
-    btn18.setColour(juce::TextButton::textColourOffId,
-                    is18 ? GB::black : GB::btnBlackText);
-    btn24.setColour(juce::TextButton::textColourOffId,
-                    !is18 ? GB::black : GB::btnBlackText);
-
-    btn18.repaint();
-    btn24.repaint();
+    auto state = apvts.copyState();
+    std::unique_ptr<juce::XmlElement> xml (state.createXml());
+    copyXmlToBinary (*xml, destData);
 }
 
-void GainBuddyAudioProcessorEditor::timerCallback()
+void GainBuddyAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
-    float trim = proc.apvts.getRawParameterValue("trim")->load();
-    trimValLabel.setText((trim >= 0 ? "+" : "") + juce::String(trim, 2) + " dB",
-                         juce::dontSendNotification);
-    float ag = proc.getAutoGainDB();
-    autoGainLabel.setText("auto: " + (ag >= 0 ? juce::String("+") : juce::String(""))
-                          + juce::String(ag, 1) + " dB",
-                          juce::dontSendNotification);
-    updateTargetButtons();
+    std::unique_ptr<juce::XmlElement> xml (getXmlFromBinary (data, sizeInBytes));
+    if (xml && xml->hasTagName (apvts.state.getType()))
+        apvts.replaceState (juce::ValueTree::fromXml (*xml));
 }
 
-void GainBuddyAudioProcessorEditor::drawScrew(juce::Graphics& g, float x, float y)
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
-    g.setColour(juce::Colour(0xff9a9690)); g.fillEllipse(x-6,y-6,12,12);
-    g.setColour(juce::Colour(0xff555250)); g.drawEllipse(x-6,y-6,12,12,1.0f);
-    g.setColour(juce::Colour(0xff333030));
-    g.fillRect(x-3.0f,y-0.7f,6.0f,1.4f);
-    g.fillRect(x-0.7f,y-3.0f,1.4f,6.0f);
-}
-
-void GainBuddyAudioProcessorEditor::paint(juce::Graphics& g)
-{
-    float w=(float)getWidth(), h=(float)getHeight();
-
-    g.setColour(GB::bg); g.fillRoundedRectangle(0,0,w,h,10.0f);
-    g.setColour(juce::Colours::white.withAlpha(0.28f)); g.drawLine(1,1,w-1,1,1.5f);
-    g.setColour(juce::Colour(0xff888480)); g.drawLine(1,h-1,w-1,h-1,1.5f);
-
-    // Top bar
-    g.setColour(GB::topBar); g.fillRoundedRectangle(0,0,w,62,10.0f);
-    g.fillRect(0.0f,20.0f,w,42.0f);
-    g.setColour(juce::Colour(0xffaaa8a0)); g.drawHorizontalLine(62,0,w);
-
-    // Logo: GAIN BUDDY with one space
-    g.setColour(GB::black);
-    g.setFont(juce::Font("Arial Black", 26.0f, juce::Font::bold));
-    g.drawText("GAIN", 18, 10, 76, 36, juce::Justification::centredLeft);
-    g.setColour(GB::orange);
-    g.drawText("BUDDY", 80, 10, 120, 36, juce::Justification::centredLeft);
-
-    // Subtitle: Made by Polak
-    g.setColour(juce::Colour(0xff666260));
-    g.setFont(juce::Font("Arial Black", 10.0f, juce::Font::bold));
-    g.drawText("MADE BY POLAK", 18, 42, 200, 16, juce::Justification::centredLeft);
-
-    // Panel backgrounds
-    auto drawPanel = [&](int px, int py, int pw, int ph) {
-        g.setColour(GB::panel);
-        g.fillRoundedRectangle((float)px,(float)py,(float)pw,(float)ph, 5.0f);
-        g.setColour(juce::Colours::white.withAlpha(0.18f));
-        g.drawLine((float)px,(float)py+1,(float)(px+pw),(float)py+1, 0.8f);
-        g.setColour(juce::Colour(0xff999590));
-        g.drawRoundedRectangle((float)px,(float)py,(float)pw,(float)ph, 5.0f, 0.8f);
-    };
-    drawPanel(14, 68,  getWidth()-28, 70);
-    drawPanel(14, 150, getWidth()-28, 216);
-
-    // Section labels — same font as buttons
-    g.setColour(juce::Colour(0xff555250));
-    g.setFont(juce::Font("Arial Black", 11.0f, juce::Font::bold));
-    g.drawText("TARGET", 20, 70,  200, 14, juce::Justification::centredLeft);
-    g.drawText("LUFS",   20, 152, 200, 14, juce::Justification::centredLeft);
-    g.drawText("TRIM",   224, 152, 80,  14, juce::Justification::centredLeft);
-    g.setFont(juce::Font("Arial Black", 9.0f, juce::Font::bold));
-
-    drawScrew(g,12,12); drawScrew(g,w-12,12);
-    drawScrew(g,12,h-12); drawScrew(g,w-12,h-12);
-}
-
-void GainBuddyAudioProcessorEditor::resized()
-{
-    btn18.setBounds(20,  84, 158, 36);
-    btn24.setBounds(186, 84, 158, 36);
-
-    lufsDisplay.setBounds(20, 168, 182, 180);
-
-    trimKnob.setBounds(216, 168, 120, 96);
-    trimValLabel.setBounds(216, 304, 136, 22);
-    autoGainLabel.setBounds(216, 328, 136, 20);
+    return new GainBuddyAudioProcessor();
 }
